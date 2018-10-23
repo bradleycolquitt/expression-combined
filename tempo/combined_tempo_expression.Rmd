@@ -1,0 +1,391 @@
+---
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+````{r}
+#library(dplyr)
+library(tidyverse)
+library(GGally)
+library(WGCNA) # load before reshape2, as depends on reshape
+library(data.table)
+library(reshape2)
+#library(ggplot2)
+library(gridExtra)
+
+library(genefilter)
+library(flashClust)
+
+library(stringr)
+#library(tidyr)
+#source("~/data2/rstudio/birds/utils/seq_packages.R")
+source("~/data2/rstudio/birds/utils/seq_analysis.R")
+source("~/data2/rstudio/birds/utils/colors.R")
+source("~/data2/rstudio/birds/utils/network.R")
+source("~/data2/rstudio/birds/utils/db.R")
+source("~/data2/rstudio/birds/utils/stats.R")
+#source("~/data2/rstudio/birds/utils/scde.R")
+source("~/data2/rstudio/birds/utils/common_aesthetics.R")
+library(viridis)
+library(RColorBrewer)
+library(lazyeval)
+
+options(httr_oob_default = T)
+```
+
+```{r}
+filter = dplyr::filter
+select = dplyr::select
+rename = dplyr::rename
+```
+
+```{r}
+theme_set(theme_bw())
+```
+
+```{r}
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()
+```
+
+## Set up dir
+```{r}
+tname = "ncbi_apollo_justIntact_songsystem"
+```
+
+```{r}
+prefix = "~/data2/rstudio/birds//combined/tempo"
+prefix = paste(prefix, tname, sep="/")
+dir.create(prefix, recursive=T)
+dir.create(paste(prefix, "figures", sep="/"))
+
+#project_prefix = "~/data2/rstudio/birds/deafen/seq_analysis"
+#prefix_data = paste(project_prefix, "summaries", sep="/")
+#prefix_data = paste(prefix_data, tname, sep="/")
+```
+
+## Load data
+
+```{r}
+db = src_sqlite("~/data/umi_db/combined.db")
+mags1 = collect(tbl(db, "normalized_filtered_batchTags"), collect=Inf)
+```
+
+```{r}
+info_db = "combined.db"
+info_table = "db_info_combined_curated"
+info = load_umi_info(info_db, info_table)
+```
+
+```{r}
+info$position = factor(info$position, 
+                       levels=position_levels)
+```
+
+```{r}
+info2 = droplevels(info %>% filter(!(position %in% c("lfs", "ov", "meso"))))
+info2 = droplevels(info %>% filter(!is.na(songsystem)))
+info_red = info2 %>% select(id, barcode, id2, tags, position, songsystem)
+```
+
+
+
+```{r}
+tempo_stats_fname = "~/data2/rstudio/birds/combined/tempo/brad_allbirds.csv"
+tempo_stats = read_csv(tempo_stats_fname)
+colnames(tempo_stats) = make.names(colnames(tempo_stats))
+tempo_stats = tempo_stats %>% rename(tags = birdID)
+```
+
+```{r}
+info_red = info_red %>% left_join(tempo_stats)
+```
+
+```{r}
+mags1 = mags1 %>% left_join(info_red) 
+```
+
+
+```{r}
+genes = c("SLC39A11|SSR2")
+
+tmp = mags1 %>% 
+  filter(grepl(genes, gene_id))
+
+gg = ggplot(tmp, aes(average, value))
+gg = gg + geom_point()
+gg = gg + facet_grid(gene_id~position)
+gg
+
+tmp1 = tmp %>% 
+  group_by(tags, position, gene_id) %>% 
+  summarize(value = mean(value, na.rm=T)) %>%
+  left_join(info_red)
+
+gg = ggplot(tmp1, aes(average, value, color=tags))
+gg = gg + geom_point()
+gg = gg + facet_grid(gene_id~position)
+gg = gg + stat_smooth(method="lm")
+gg
+
+gg = ggplot(tmp1, aes(average, value, color=tags))
+gg = gg + geom_point()
+gg = gg + geom_text(aes(label=tags))
+gg = gg + facet_grid(gene_id~position)
+gg = gg + stat_smooth(method="lm")
+gg
+
+gg = ggplot(tmp1 %>% filter(position %in% c("hvc")), aes(average, value, color=tags))
+gg = gg + geom_point()
+gg = gg + geom_text(aes(label=tags))
+gg = gg + facet_grid(gene_id~position)
+gg = gg + stat_smooth(method="lm")
+gg
+```
+
+
+```{r}
+values = c("average", "median", "median.isi", "mean.isi", "median.syllen", "mean.syllen")
+
+walk(values, function(v) {
+  gg = ggplot(tmp1 %>% filter(position %in% c("hvc")), aes_string(v, "value", color="tags"))
+  gg = gg + geom_point()
+  gg = gg + geom_text(aes(label=tags))
+  gg = gg + facet_wrap(~gene_id, scales="free")
+  gg = gg + stat_smooth(method="lm")
+  gg = gg + labs(title=v)
+  print(gg)
+})
+
+values = c("average", "median", "median.isi", "mean.isi", "median.syllen", "mean.syllen")
+
+tmp2 = tmp1 %>% filter(Procedure != "cochlea removal")
+walk(values, function(v) {
+  gg = ggplot(tmp2 %>% filter(position %in% c("hvc")), aes_string(v, "value", color="tags"))
+  gg = gg + geom_point()
+  gg = gg + geom_text(aes(label=tags))
+  gg = gg + facet_wrap(~gene_id, scales="free")
+  gg = gg + stat_smooth(method="lm")
+  gg = gg + labs(title=v)
+  print(gg)
+})
+
+tmp2 = tmp1 %>% filter(Procedure != "cochlea removal") %>%
+  filter(gene_id == "SLC39A11")
+walk(values, function(v) {
+  gg = ggplot(tmp2 %>% filter(position %in% c("hvc")), aes_string(v, "value", color="tags"))
+  gg = gg + geom_point()
+  gg = gg + geom_text(aes(label=tags))
+  gg = gg + facet_wrap(~gene_id, scales="free")
+  gg = gg + stat_smooth(method="lm")
+  gg = gg + labs(title=v)
+  print(gg)
+})
+```
+```{r}
+tmp2 = tmp1 %>% 
+  filter(Procedure != "cochlea removal" | is.na(Procedure)) %>%
+  filter(gene_id == "SLC39A11") %>%
+  filter(!(tags %in% c("wh32br40"))) %>% 
+  distinct(tags, position, gene_id, .keep_all=T)
+walk(values, function(v) {
+  gg = ggplot(tmp2 %>% filter(position %in% c("hvc")), aes_string(v, "value", color="tags"))
+  gg = gg + geom_point()
+  gg = gg + geom_text(aes(label=tags))
+  gg = gg + facet_wrap(~gene_id, scales="free")
+  gg = gg + stat_smooth(method="lm")
+  gg = gg + labs(title=v)
+
+  print(gg)
+})
+```
+```{r}
+tmp2 = tmp1 %>% 
+  filter(Procedure != "cochlea removal" | is.na(Procedure)) %>%
+  filter(gene_id == "SSR2_0") %>%
+  filter(!(tags %in% c("wh32br40"))) %>% 
+  distinct(tags, position, gene_id, .keep_all=T)
+walk(values, function(v) {
+  gg = ggplot(tmp2 %>% filter(position %in% c("hvc")), aes_string(v, "value", color="tags"))
+  gg = gg + geom_point()
+  gg = gg + geom_text(aes(label=tags))
+  gg = gg + facet_wrap(~gene_id, scales="free")
+  gg = gg + stat_smooth(method="lm")
+  gg = gg + labs(title=v)
+
+  print(gg)
+})
+```
+
+
+## Load data - no batch correction
+
+```{r}
+db = src_sqlite("~/data/umi_db/combined.db")
+mags1 = collect(tbl(db, "normalized_filtered"), collect=Inf)
+```
+
+```{r}
+info_db = "combined.db"
+info_table = "db_info_combined_curated"
+info = load_umi_info(info_db, info_table)
+```
+
+```{r}
+info$position = factor(info$position, 
+                       levels=position_levels)
+```
+
+```{r}
+info2 = droplevels(info %>% filter(!(position %in% c("lfs", "ov", "meso"))))
+info2 = droplevels(info %>% filter(!is.na(songsystem)))
+info_red = info2 %>% select(id, barcode, id2, tags, position, songsystem)
+```
+
+
+
+```{r}
+tempo_stats_fname = "~/data2/rstudio/birds/combined/tempo/brad_allbirds.csv"
+tempo_stats = read_csv(tempo_stats_fname)
+colnames(tempo_stats) = make.names(colnames(tempo_stats))
+tempo_stats = tempo_stats %>% rename(tags = birdID)
+```
+
+```{r}
+info_red = info_red %>% left_join(tempo_stats)
+```
+
+```{r}
+mags1 = mags1 %>% left_join(info_red) 
+```
+
+
+```{r}
+genes = c("SLC39A11|SSR2")
+
+tmp = mags1 %>% 
+  filter(grepl(genes, gene_id))
+
+gg = ggplot(tmp, aes(average, value))
+gg = gg + geom_point()
+gg = gg + facet_grid(gene_id~position)
+gg
+
+tmp1 = tmp %>% 
+  group_by(tags, position, gene_id) %>% 
+  summarize(value = mean(value, na.rm=T)) %>%
+  left_join(info_red)
+
+gg = ggplot(tmp1, aes(average, value, color=tags))
+gg = gg + geom_point()
+gg = gg + facet_grid(gene_id~position)
+gg = gg + stat_smooth(method="lm")
+gg
+
+gg = ggplot(tmp1, aes(average, value, color=tags))
+gg = gg + geom_point()
+gg = gg + geom_text(aes(label=tags))
+gg = gg + facet_grid(gene_id~position)
+gg = gg + stat_smooth(method="lm")
+gg
+
+gg = ggplot(tmp1 %>% filter(position %in% c("hvc")), aes(average, value, color=tags))
+gg = gg + geom_point()
+gg = gg + geom_text(aes(label=tags))
+gg = gg + facet_grid(gene_id~position)
+gg = gg + stat_smooth(method="lm")
+gg
+```
+
+
+```{r}
+values = c("average", "median", "median.isi", "mean.isi", "median.syllen", "mean.syllen")
+
+walk(values, function(v) {
+  gg = ggplot(tmp1 %>% filter(position %in% c("hvc")), aes_string(v, "value", color="tags"))
+  gg = gg + geom_point()
+  gg = gg + geom_text(aes(label=tags))
+  gg = gg + facet_wrap(~gene_id, scales="free")
+  gg = gg + stat_smooth(method="lm")
+  gg = gg + labs(title=v)
+  print(gg)
+})
+
+values = c("average", "median", "median.isi", "mean.isi", "median.syllen", "mean.syllen")
+
+tmp2 = tmp1 %>% filter(Procedure != "cochlea removal")
+walk(values, function(v) {
+  gg = ggplot(tmp2 %>% filter(position %in% c("hvc")), aes_string(v, "value", color="tags"))
+  gg = gg + geom_point()
+  gg = gg + geom_text(aes(label=tags))
+  gg = gg + facet_wrap(~gene_id, scales="free")
+  gg = gg + stat_smooth(method="lm")
+  gg = gg + labs(title=v)
+  print(gg)
+})
+
+tmp2 = tmp1 %>% filter(Procedure != "cochlea removal") %>%
+  filter(gene_id == "SLC39A11")
+walk(values, function(v) {
+  gg = ggplot(tmp2 %>% filter(position %in% c("hvc")), aes_string(v, "value", color="tags"))
+  gg = gg + geom_point()
+  gg = gg + geom_text(aes(label=tags))
+  gg = gg + facet_wrap(~gene_id, scales="free")
+  gg = gg + stat_smooth(method="lm")
+  gg = gg + labs(title=v)
+  print(gg)
+})
+```
+```{r}
+tmp2 = tmp1 %>% 
+  filter(Procedure != "cochlea removal" | is.na(Procedure)) %>%
+  filter(gene_id == "SLC39A11") %>%
+  filter(!(tags %in% c("wh32br40"))) %>% 
+  distinct(tags, position, gene_id, .keep_all=T)
+walk(values, function(v) {
+  gg = ggplot(tmp2 %>% filter(position %in% c("hvc")), aes_string(v, "value", color="tags"))
+  gg = gg + geom_point()
+  gg = gg + geom_text(aes(label=tags))
+  gg = gg + facet_wrap(~gene_id, scales="free")
+  gg = gg + stat_smooth(method="lm")
+  gg = gg + labs(title=v)
+
+  print(gg)
+})
+```
+
+```{r}
+tmp2 = tmp1 %>% 
+  filter(Procedure != "cochlea removal" | is.na(Procedure)) %>%
+  filter(gene_id == "SSR2_0") %>%
+  filter(!(tags %in% c("wh32br40"))) %>% 
+  distinct(tags, position, gene_id, .keep_all=T)
+walk(values, function(v) {
+  gg = ggplot(tmp2 %>% filter(position %in% c("hvc")), aes_string(v, "value", color="tags"))
+  gg = gg + geom_point()
+  gg = gg + geom_text(aes(label=tags))
+  gg = gg + facet_wrap(~gene_id, scales="free")
+  gg = gg + stat_smooth(method="lm")
+  gg = gg + labs(title=v)
+
+  print(gg)
+})
+```
+
+```{r}
+tmp2 = tmp1 %>% 
+  filter(Procedure != "cochlea removal" | is.na(Procedure)) %>%
+  filter(gene_id == "SSR2_0") %>%
+  filter(!(tags %in% c("wh32br40"))) %>% 
+  distinct(tags, position, gene_id, .keep_all=T)
+walk(values, function(v) {
+  gg = ggplot(tmp2, aes_string(v, "value", color="tags"))
+  gg = gg + geom_point()
+  #gg = gg + geom_text(aes(label=tags))
+  gg = gg + facet_wrap(~position, scales="free")
+  gg = gg + stat_smooth(method="lm")
+  gg = gg + labs(title=v)
+
+  print(gg)
+})
+```
