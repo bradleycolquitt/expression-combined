@@ -1,0 +1,1363 @@
+---
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+```{r}
+source("~/data2/rstudio/birds/utils/seq_packages.R")
+source("~/data2/rstudio/birds/utils/seq_analysis.R")
+source("~/data2/rstudio/birds/utils/db.R")
+#source("~/data2/rstudio/birds/utils/go.R")
+source("~/data2/rstudio/birds/utils/ggplot.R")
+#source("~/data2/rstudio/birds/utils/voom.R")
+source("~/data2/rstudio/birds/utils/stats.R")
+source("~/data2/rstudio/birds/utils/common_aesthetics.R")
+library(limma)
+library(edgeR)
+library(sva)
+library(impute)
+library(reshape2)
+library(wrapr)
+library(here)
+library(cowplot)
+
+library(rtracklayer)
+library(GenomicFeatures)
+
+library(SCnorm)
+
+BiocParallel::register(MulticoreParam(6))
+BiocParallel::register(SerialParam())
+
+select = dplyr::select 
+filter = dplyr::filter
+acast = reshape2::acast
+rename = dplyr::rename
+```
+
+```{r}
+options(httr_oob_default=TRUE)
+# gs_auth(new_user = TRUE)
+# gs_ls()
+```
+
+```{r}
+tname = "ncbi_apollo_bc_full_offset_scnorm"
+```
+
+```{r}
+project_prefix = here::here() 
+prefix = file.path(project_prefix, "summaries", tname)
+prefix_figures = file.path(prefix, "figures")
+
+dir.create(prefix, recursive=T)
+dir.create(prefix_figures)
+```
+
+## Prep metadata
+```{r}
+info_dbs = list(c("deaf1/info.db",  "db_info_switch160730_14d"),
+                c("topo.db", "db_info"))
+
+info = map_dfr(info_dbs, ~load_umi_info(.x[1], .x[2])) 
+
+info = info %>% mutate(index2 = if_else(experiment=="topography", idsequencing, index2))
+```
+
+```{r}
+info = info %>% mutate(position = sub("[a-z]+_", "", position))
+```
+
+```{r}
+info_red = info %>%
+  #select(-index2) %>%
+  #rename(index2 = idlibrary) %>%
+  select(id, barcode, index1, index2,  id2, procedure2, tags, position, experiment)
+# info_red = info_red %>% left_join(position_table)
+```
+
+## Prep seq data
+```{r}
+db_names = list(c("deaf1/deaf1_ncbi_apollo_bc_full_offset_mm1.db", 1),
+                c("deaf1/deaf1_ncbi_apollo_bc_full_offset_mm1_14d.db", 56),
+                c("topography/topo_ncbi_apollo_bc_full_offset.db", 1))
+data = map_dfr(db_names, function(db_name1) load_umi_db(db_name1[[1]], db_name1[[2]]))
+
+dim(data)
+colSums(data[,c("unique_umi", "total_umi")])
+data %>% group_by(barcode) %>% summarize_at(vars(matches("umi")), funs(mean, sum)) %>% 
+  mutate(unique_umi_frac = unique_umi_sum / sum(unique_umi_sum))
+```
+```{r}
+data %>% group_by(index1, index2) %>% summarize_at(vars(matches("umi")), funs(mean, sum)) %>% 
+  mutate(unique_umi_frac = unique_umi_sum / sum(unique_umi_sum))
+```
+
+
+
+```{r}
+# data_s = data %>% group_by(id) %>% do({
+#   d = .
+#   subsample_umi4(d, "unique_umi", 200000)
+# })
+```
+
+```{r}
+data = inner_join(data, info_red, by=c("barcode", "index1", "index2"))
+```
+```{r}
+positions_to_use = c("ra", "arco", "hvc", "ncl", "lman", "nido", "x", "stri")
+data = data %>% filter(position %in% positions_to_use)
+```
+
+
+### Sample stats
+```{r}
+data_summary_red = data %>% 
+  group_by(id) %>%
+  summarize(unique_umi=sum(unique_umi), total_umi=sum(total_umi), ratio_umi_mean = mean(ratio_umi), ratio_umi_sd=sd(ratio_umi))
+data_summary = left_join(data_summary_red, info, by=c("id"))
+data_summary = data_summary %>% mutate(barcode = factor(barcode))
+```
+
+```{r}
+ungroup(data_summary) %>% 
+  summarize(unique_umi_mean = mean(unique_umi),
+            unique_umi_sd = sd(unique_umi),
+            total_umi_mean = mean(total_umi), 
+            total_umi_sd = sd(total_umi))
+```
+
+```{r}
+gg = ggplot(data_summary, aes(log10(unique_umi), ratio_umi_mean)) 
+gg = gg + geom_point(alpha=.5, aes(color=index1))
+gg = gg + facet_wrap(~position)
+gg
+ggsave(paste(prefix_figures, "ratio_umi_mean.pdf", sep="/"), height=8, width=8)
+```
+
+```{r}
+data_summary = data_summary %>% mutate(seq_satur = ratio_umi_mean > 10)
+data_summary %>% 
+  group_by(position) %>% 
+  summarize(num_saturated = sum(seq_satur),
+            frac_saturated = num_saturated / n())
+
+```
+Little saturation
+
+```{r}
+info = info %>% left_join(data_summary %>% select(id, id2, idsequencing, ratio_umi_mean))
+info = info %>% filter(ratio_umi_mean<=10)
+```
+
+```{r}
+gg = ggplot(data_summary, aes(factor(lib_column), log10(unique_umi), color=tags))
+gg = gg + geom_point(position=position_jitter(width=.2), alpha=1) 
+gg = gg + facet_wrap(~position)
+#gg = gg + geom_hline(yintercept=2000)
+gg
+ggsave(file.path(prefix_figures, "umi_by_lib_column.pdf"), height=8, width=8)
+```
+Reduction on right columns
+
+```{r}
+gg = ggplot(data_summary, aes(factor(lib_row), log10(unique_umi)))
+gg = gg + geom_point(position=position_jitter(width=.2), alpha=.1) 
+gg = gg + facet_wrap(~position)
+#gg = gg + geom_hline(yintercept=2000)
+gg
+ggsave(file.path(prefix_figures, "umi_by_lib_row.pdf"), height=8, width=8)
+```
+
+
+```{r}
+gg = ggplot(data_summary, aes(tags, log10(unique_umi), color=brain_side)) +
+  geom_point(position=position_jitter(width=.2), alpha=1) +
+  facet_wrap(~position)
+gg = gg + theme_bw()
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+#gg = gg + labs(x="Duration of experiment")
+gg
+ggsave(file.path(prefix_figures, "umi_by_tags.pdf"), height=8, width=8)
+```
+No strong by tag differences
+
+
+#### Unique umi totals - heatmap
+```{r}
+#tmp = data_summary %>% group_by(id2, barcode) %>%
+#  summarize(unique_umi=sum(unique_umi))
+tmp2 = data_summary
+tmp2$barcode = as.numeric(as.character(tmp2$barcode))
+
+ggplot(tmp2, aes(barcode, id2, fill=log10(unique_umi))) + geom_tile() + scale_fill_viridis()
+ggsave(file.path(prefix_figures, "unique_umi_heatmap.pdf"), height=12, width=12)
+```
+
+```{r}
+data = data %>% 
+  filter(id %in% info$id) %>%
+  group_by(id, gene_id) %>% 
+  summarize(unique_umi = sum(unique_umi)) %>%
+  left_join(info_red) %>%
+  distinct(gene_id, id, .keep_all=T)
+```
+
+#### Calculate fraction mito
+```{r}
+tx = import("~/data2/assembly/lonStrDom1/ncbi/lonStrDom1.ncbi.apollo6/merge_inter_apollo_processed_mt_gffread.gtf")
+tx_mt = tx[seqnames(tx)=="MT"]
+```
+
+
+```{r}
+data_mito = data %>% group_by(id) %>% 
+  summarize(frac_mito = sum(unique_umi[gene_id %in% tx_mt$gene_name]) / sum(unique_umi))
+info = info %>% left_join(data_mito)
+info_red = info_red %>% left_join(data_mito)
+```
+
+```{r}
+# gene_ids = unique(data$gene_id)
+# gene_ids_mt = gene_ids[unique(unlist(map(tx_mt$gene_name, ~grep(.x, gene_ids))))]
+# 
+# data = data %>% filter(!(gene_id %in% gene_ids_mt))
+# data = data %>% filter(gene_id !="*")
+```
+
+
+
+```{r}
+gg = ggplot(info, aes(frac_mito))
+gg = gg + geom_density()
+gg
+```
+
+```{r}
+gg = ggplot(info, aes(tags, frac_mito))
+gg = gg + geom_point()
+gg = gg + facet_wrap(~position)
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust = 1))
+gg
+save_plot(file.path(prefix_figures, "frac_mito_by_tags_position.pdf"), gg, base_width = 2, base_height=2, ncol=3, nrow=2)
+```
+Generally higher mitochondrial fraction with fieldL, hvc, and ncl
+```{r}
+gg = ggplot(info, aes(section_area, frac_mito))
+gg = gg + geom_point()
+gg
+save_plot(file.path(prefix_figures, "frac_mito_vs_section_area.pdf"), gg, base_height=4, base_aspect_ratio = 1.1)
+```
+No association between section_area and frac_mito
+```{r}
+dat = acast(data, gene_id~id, value.var="unique_umi", fill=0)
+```
+
+
+### Calculate CDR and filter out low CDR samples
+
+
+```{r}
+cdr = colSums(dat>1)
+cdr_thresh = 3000
+cairo_pdf(file.path(prefix_figures, "cdr_density.pdf"), width = 6, height=6)
+plot(density(cdr))
+abline(v=cdr_thresh, col=2)
+dev.off()
+
+plot(density(cdr))
+abline(v=cdr_thresh, col=2)
+
+cdr_scaled = scale(cdr)
+info$cdr_scaled = cdr_scaled[match(info$id, rownames(cdr_scaled)),1]
+info_red$cdr_scaled = cdr_scaled[match(info_red$id, rownames(cdr_scaled)),1]
+```
+
+Write info with cdr_scaled to db_name
+```{r}
+#info_db_db = src_sqlite(paste("~/data/umi_db/", db_names[[1]][1], sep="/"))
+#copy_to(info_db_db, info, sprintf("%s", info_table), temporary=F, overwrite=T)
+```
+
+```{r}
+dat = dat[,cdr>cdr_thresh]
+info = info %>% filter(id %in% colnames(dat))
+#write.table(dat, file = file.path(prefix, sprintf("counts_cdr%s.txt", cdr_thresh)),
+#            quote=F, sep="\t")
+```
+
+```{r}
+data_summary1 = data_summary %>% filter(id %in% info$id)
+gg = ggplot(data_summary1, aes(log10(unique_umi), ratio_umi_mean, color=tags)) 
+gg = gg + geom_point(alpha=I(1/4))
+gg = gg + facet_wrap(~position)
+gg
+ggsave(file.path(prefix_figures, "ratio_umi_mean_filterCDR.pdf"), height=8, width=8)
+```
+
+
+
+```{r}
+# position_levels = c("ra", "arco", "hvc", "ncl", "lman", "nido", "x", "stri", "lfs", "ov", "meso", "fieldl")
+# info$position = factor(info$position, 
+#                        levels=position_levels)
+# info$songsystem = ifelse(info$songsystem==1, TRUE, FALSE)
+```
+
+```{r}
+# info2 = droplevels(info %>% filter(!(position %in% c("lfs", "ov", "meso"))))
+# data = data %>% filter(!(position %in% c("lfs", "ov", "meso"))) %>% droplevels()
+```
+
+### Filter out lowly expressed genes for norm
+```{r}
+mean_thresh = 1
+gene_means = rowMeans(log2(dat+1))
+
+cairo_pdf(paste(prefix, "figures", "gene_means.pdf", sep="/"), width=6, height=6)
+plot(density(gene_means))
+abline(v=mean_thresh, col=2)
+dev.off()
+
+plot(density(gene_means))
+abline(v=mean_thresh, col=2)
+
+dat1 = dat[gene_means > mean_thresh,]
+nrow(dat1) / nrow(dat)
+
+dat_f = dat1
+```
+
+
+### Calc SCnorm
+```{r}
+info1 = info %>% filter(id %in% colnames(dat_f))
+conditions = info1$position
+dat = dat_f[,match(info1$id, colnames(dat_f))]
+```
+
+```{r}
+#pdf(file.path(prefix, "figures", "check_data"))
+plotCountDepth(Data = dat, Conditions = conditions ,
+                FilterCellProportion = .1 )
+#dev.off()
+```
+
+```{r}
+info_test = info1 %>% filter(position=="ra")
+dat_test = dat_i[,match(info_test$id, colnames(dat_i))]
+
+
+dat_test = t(apply(dat_test, 1, function(x) tapply(x, colnames(dat_test), sum)))
+conditions_test = rep(1, times=ncol(dat_test))
+#dat_test[dat_test==0] = NA
+#dat_log = log(dat_test)
+#dat_test_dith = exp(t(apply(dat_log, 1, function(x) dither(x, type = "symmetric", value = .01))))
+#dat_test_dith[is.na(dat_test_dith)] = 0
+# dat_norm = SCnorm(dat_test_dith, conditions_test,
+#                    OutputName = paste(prefix, "figures", "data_norm", sep="/"),
+#                    FilterCellNum = 10, PropToUse = .1, NCores = 10,
+#                    Thresh = .05, ditherCounts = F)
+
+dat_norm = SCnorm(dat_test, conditions_test,
+                   FilterCellNum = 10, PropToUse = .1, NCores = 1,
+                  PrintProgressPlots = T,
+                   Thresh = .1, ditherCounts = F, reportSF = T)
+dat_norm_mat = normcounts(dat_norm)
+```
+
+```{r}
+plotCountDepth(Data = dat_test, NormalizedData = dat_norm_mat, Conditions = conditions_test ,
+                FilterCellProportion = .1 )
+```
+
+```{r}
+redo = F
+scnorm_fname = file.path(prefix, "scnorm_obj.rds")
+if (redo) {
+  dat1 = t(apply(dat_f, 1, function(x) tapply(x, colnames(dat_f), sum)))
+  conditions = info1$position[match(colnames(dat1), info1$id)]
+  dat_norm = SCnorm(dat1, conditions,
+                    FilterCellNum = 10, PropToUse = .1, NCores = 1,
+                    # PrintProgressPlots = T,
+                    Thresh = .1, ditherCounts = F, reportSF = T, useZerosToScale = T)
+  
+  saveRDS(dat_norm, scnorm_fname)
+} else {
+  dat_norm = readRDS(scnorm_fname)
+}
+
+dat_norm_mat = SingleCellExperiment::normcounts(dat_norm) 
+offsets = results(dat_norm, type="ScaleFactors")
+#offsets = t(scale(t(offsets), center = T, scale = F))
+```
+
+### Calculate magnitudes
+```{r}
+mags = melt(log2(dat_norm_mat+1))
+colnames(mags) = c("gene_id", "id", "value") 
+
+mags = mags %>% left_join(info_red) %>%
+  distinct(id, gene_id, .keep_all=T)
+```
+### Impute
+```{r}
+library(DrImpute)
+```
+
+```{r}
+
+mags_i = map(positions, function(p) {
+  info_cur = info %>% filter(position==p)
+  dat_norm_mat_cur = dat_norm_mat[,colnames(dat_norm_mat) %in% info_cur$id]
+  dat_norm_mat_i = DrImpute(log2(dat_norm_mat_cur+1), ks=6:10)
+  mags_i = melt(dat_norm_mat_i)
+  colnames(mags_i) = c("gene_id", "id", "value_impute") 
+  mags_i
+}) %>% bind_rows()
+
+mags = mags %>% left_join(mags_i)
+```
+```{r}
+tp = c("NEFM", "ACTB", "PVALB", "MEF2C", "SNCA", "CRHBP")
+gg = ggplot(mags %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(position, value, color=tags)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+gg = ggplot(mags %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(position, value_impute, color=tags)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + facet_wrap(~gene_id)
+gg
+```
+
+### Batch correct
+```{r}
+redo = T
+combat_fname = file.path(prefix, "mags_combat.rds")
+
+if (redo) {
+  positions = na.omit(unique(info$position))
+  mags1 = map(as.character(positions), function(p) {
+    print(p)
+    
+    mags1_f = mags %>% filter(position==p) %>%
+      select(gene_id, id, value) %>% group_by(gene_id, id) %>%
+      summarize(value = mean(value, na.rm=T)) %>% 
+      ungroup() %>%
+      spread(id, value, fill=0) 
+    mags1_mat = mags1_f %>% select(-gene_id) %>% as.matrix() 
+    rownames(mags1_mat) = mags1_f$gene_id
+    
+    info_mag = info[info$id %in% colnames(mags1_mat),] %>% droplevels()
+    mod = model.matrix(~1, info_mag)
+    mags1_mat = mags1_mat[,match(info_mag$id, colnames(mags1_mat))]
+    mags1_comb = ComBat(mags1_mat, batch = info_mag$tags, mod=mod)
+    
+    mags1_melt = melt(mags1_comb)
+    colnames(mags1_melt) = c("gene_id", "id", "value")
+    
+    ## Combat imputed
+    mags1_f = mags %>% filter(position==p) %>%
+      select(gene_id, id, value_impute) %>%
+      group_by(gene_id, id) %>%
+      summarize(value = mean(value_impute, na.rm=T)) %>% 
+      ungroup() %>%
+      spread(id, value, fill=0) 
+    mags1_mat = mags1_f %>% select(-gene_id) %>% as.matrix() 
+    rownames(mags1_mat) = mags1_f$gene_id
+    
+    info_mag = info[info$id %in% colnames(mags1_mat),] %>% droplevels()
+    mod = model.matrix(~1, info_mag)
+    mags1_mat = mags1_mat[,match(info_mag$id, colnames(mags1_mat))]
+    mags1_comb = ComBat(mags1_mat, batch = info_mag$tags, mod=mod)
+    
+    mags1_i_melt = melt(mags1_comb)
+    colnames(mags1_i_melt) = c("gene_id", "id", "value_impute")
+    mags1_melt %>% left_join(mags1_i_melt)
+  }) %>% set_names(positions) %>% bind_rows(.id="position") %>% left_join(info_red)
+  mags1 = mags1 %>% distinct(id, gene_id, .keep_all=T)
+  saveRDS(mags1, combat_fname)
+} else {
+  mags1 = readRDS(combat_fname)
+}
+```
+
+```{r}
+  mags1_f = mags %>%
+    select(gene_id, id, value) %>% 
+    #group_by(gene_id, id) %>%
+    #summarize(value = mean(value, na.rm=T)) %>% 
+    #ungroup() %>%
+    spread(id, value, fill=0) 
+  mags1_mat = mags1_f %>% select(-gene_id) %>% as.matrix() 
+  rownames(mags1_mat) = mags1_f$gene_id
+  
+  info_mag = info[info$id %in% colnames(mags1_mat),] %>% droplevels() %>%
+    mutate(position_tags = paste(position, tags, sep="_"))
+  mod = model.matrix(~1, info_mag)
+  mags1_mat = mags1_mat[,match(info_mag$id, colnames(mags1_mat))]
+  mags2_comb = ComBat(mags1_mat, batch = info_mag$position_tags, mod=mod)
+  
+  mags2 = melt(mags2_comb)
+  colnames(mags2) = c("gene_id", "id", "value")
+  mags2 = mags2 %>% left_join(info_red) %>%
+    distinct(id, gene_id, .keep_all=T)
+```
+
+
+### Example genes
+```{r}
+mags = mags %>% left_join(position_table) %>%  mutate(position = factor(position, levels=position_levels),
+                      position_pretty = factor(position_pretty, levels=position_pretty_levels))
+mags1 = mags1 %>% left_join(position_table) %>%  mutate(position = factor(position, levels=position_levels),
+                      position_pretty = factor(position_pretty, levels=position_pretty_levels))
+mags2 = mags2 %>% left_join(position_table) %>%  mutate(position = factor(position, levels=position_levels),
+                      position_pretty = factor(position_pretty, levels=position_pretty_levels))
+```
+
+```{r}
+tp = c("NEFM", "ACTB", "PVALB", "MEF2C", "SNCA", "CRHBP")
+gg = ggplot(mags %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(position, value, color=tags)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+gg = ggplot(mags %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(position, value_impute, color=tags)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+
+gg = ggplot(mags1 %>% 
+         filter(gene_id %in% tp), aes(position, value, color=tags)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+gg = ggplot(mags1 %>% 
+         filter(gene_id %in% tp), aes(position, value_impute, color=tags)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+
+gg = ggplot(mags2 %>% 
+         filter(gene_id %in% tp), aes(position, value, color=tags)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+
+
+
+```
+
+# Sample visualization
+## TSNE
+```{r}
+library(Rtsne)
+library(Seurat)
+```
+
+#### Filter by top expressors
+```{r}
+values = c("value", "value_impute")
+mags1 =mags1 %>% distinct(gene_id, id, .keep_all=T)
+to_tsne = map(c("value", "value_impute"), function(x) {
+  mags2a = acast(mags1, gene_id~id, value.var=x, fill=0)
+  mags_var = apply(mags2a, 1, LogVMR)
+  var_filter = .8
+  q = quantile(mags_var, var_filter)
+  t(mags2a[mags_var>q,])
+}) %>% set_names(values)
+```
+
+```{r}
+tsne_pred = map(to_tsne, function(x) {
+  tsne_pca = prcomp(x)
+  predict(tsne_pca, x)
+}) %>% set_names(values)
+```
+
+```{r}
+pca_dims = 1:6
+
+perplexity = c(10,20,30)
+mags1_t = map(values, function(val) {
+  mts1 = map(perplexity, function(x) {
+    m = Rtsne::Rtsne(tsne_pred[[val]][,pca_dims], perplexity=x, check_duplicates=T, pca=F)
+    mags1_t = m$Y
+    colnames(mags1_t) = c("X1", "X2")
+    data.frame(id=as.numeric(rownames(to_tsne[[val]])), mags1_t, perplexity=x)
+  })
+  mags1_t_df = bind_rows(mts1)
+  mags1_t = mags1_t_df %>% left_join(info, by="id")
+  mags1_t = mags1_t %>% left_join(data_summary_red)
+  mags1_t
+  #mags1_t_ns = mags1_t_df %>% left_join(info_ns, by="id")
+}) %>% set_names(values) %>% bind_rows(.id="value_type")
+```
+
+```{r}
+#pt1 = position_table# %>% dplyr::rename(position3=position)
+#mags1_t = mags1_t %>% left_join(pt1, by="position")
+#mags1_t_ns = mags1_t_ns %>% left_join(pt1, by="position")
+```
+
+```{r}
+prefix_tsne = file.path(prefix_figures, "tsne")
+dir.create(prefix_tsne)
+```
+
+
+```{r}
+color_vars_discrete = c("position", "tags")
+
+walk(values, function(val) {
+  walk(color_vars_discrete, function(x) {
+    gg = ggplot(mags1_t %>% filter(value_type==val), aes_string("X1", "X2", color=x))
+    gg = gg + geom_point()
+    gg = gg + facet_wrap(~perplexity)
+    gg = gg + labs(title=val)
+    print(gg)
+    save_plot(file.path(prefix_tsne,sprintf("tsne_%s_%s.pdf", val, x)), gg, base_width=4, ncol=length(perplexity))
+  })
+})
+
+color_vars_cont = c("cdr_scaled", "frac_mito", "unique_umi")
+walk(values, function(val) {
+  walk(color_vars_cont, function(x) {
+  gg = ggplot(mags1_t %>% filter(value_type==val), aes_string("X1", "X2", color=x))
+  gg = gg + geom_point()
+  gg = gg + facet_wrap(~perplexity)
+  gg = gg + scale_color_viridis()
+     gg = gg + labs(title=val)
+  print(gg)
+  save_plot(file.path(prefix_tsne,sprintf("tsne_%s_%s.pdf", val, x)), gg, base_width=4, ncol=length(perplexity))
+})
+  })
+```
+
+```{r}
+perp = 30
+tmp = mags1_t %>% filter(perplexity==perp)
+walk(values, function(val) {
+  walk(color_vars_discrete, function(x) {
+    gg = ggplot(tmp %>% filter(value_type==val), aes_string("X1", "X2", color=x))
+    gg = gg + geom_point()
+    gg = gg + facet_wrap(~perplexity)
+    gg = gg + labs(title=val)
+    print(gg)
+    save_plot(file.path(prefix_tsne,sprintf("tsne_%s_%s_perp%s.pdf", val, x, perp)), gg, base_height=5, base_aspect_ratio=1.4)
+  })
+})
+
+walk(values, function(val) {
+walk(color_vars_cont, function(x) {
+  gg = ggplot(tmp %>% filter(value_type==val), aes_string("X1", "X2", color=x))
+  gg = gg + geom_point()
+  gg = gg + facet_wrap(~perplexity)
+  gg = gg + scale_color_viridis()
+  gg = gg + labs(title=val)
+  print(gg)
+  save_plot(file.path(prefix_tsne,sprintf("tsne_%s_%s_perp%s.pdf", val, x, perp)), gg, base_height=5, base_aspect_ratio = 1.4)
+})
+})
+```
+
+
+```{r}
+walk(unique(mags1_t$position2), function(p2) {
+  tmp = mags1_t %>% filter(value_type=="value_impute") %>% filter(perplexity==30, position2==p2)
+  gg = ggplot(tmp, aes(X1, X2, color=position))
+  #gg = gg + geom_point()
+  gg = gg + theme_classic()
+  gg = gg + theme(axis.line.x=element_blank(),
+                  axis.line.y=element_blank())
+  gg = gg + scale_color_manual("", values=position_colors)
+  gg = gg + labs(x="Axis1", y="Axis2")
+  gg = gg + geom_text(aes(label=id))
+  gg = gg + facet_wrap(~position2, scales="free")
+  print(gg)
+  #ggsave(paste(prefix_tsne, "tsne_impute_colorPosition.pdf", sep="/"), width=10, height=10)
+  #save_plot(paste(prefix_tsne, "tsne_colorPosition_text.pdf", sep="/"), gg, base_height=6)
+})
+
+walk(unique(mags1_t$position), function(p) {
+  tmp <- mags1_t %>% filter(perplexity==30, position==p) %>% filter(value_type=="value_impute")
+  gg = ggplot(tmp, aes(X1, X2, color=position))
+  #gg = gg + geom_point()
+  gg = gg + theme_classic()
+  gg = gg + theme(axis.line.x=element_blank(),
+                  axis.line.y=element_blank())
+  gg = gg + scale_color_manual("", values=position_colors)
+  gg = gg + labs(x="Axis1", y="Axis2")
+  gg = gg + geom_text(aes(label=id))
+  #gg = gg + facet_wrap(~position2, scales="free")
+  print(gg)
+  #ggsave(paste(prefix_tsne, "tsne_impute_colorPosition.pdf", sep="/"), width=10, height=10)
+  #save_plot(paste(prefix_tsne, "tsne_colorPosition_text.pdf", sep="/"), gg, base_height=6)
+})
+```
+
+```{r}
+to_exclude = c(685, 2999, 4218, 748, 4522, 848, 3311, 737, 4519, 758, 860, 766, 874, 652, 672, 630, 870)
+to_ncl = c(3047,  3183)
+to_lman = c(2955, 3286, 3146)
+#to_x = c(2931)
+to_x= c()
+#to_ra = c(121, 55)
+to_ra = c()
+#to_hvc = c(3423)
+to_hvc=c()
+info_sw = info %>%
+  mutate(position = as.character(position)) %>% 
+    mutate(position = if_else(id %in% to_ra , "ra", position)) %>%
+    mutate(position = if_else(id %in% to_hvc , "hvc", position)) %>%
+  mutate(position = if_else(id %in% to_ncl , "ncl", position)) %>%
+  mutate(position = if_else(id %in% to_lman , "lman", position)) %>%
+  mutate(position = if_else(id %in% to_x, "x", position))  %>%
+  filter(!(id %in% to_exclude)) %>%
+   select(-position_pretty) %>%
+  left_join(position_table)
+
+mags1_t_sw = mags1_t %>%
+  mutate(position = as.character(position)) %>% 
+      mutate(position = if_else(id %in% to_ra , "ra", position)) %>%
+      mutate(position = if_else(id %in% to_hvc , "hvc", position)) %>%
+  mutate(position = if_else(id %in% to_ncl , "ncl", position)) %>%
+  mutate(position = if_else(id %in% to_lman , "lman", position)) %>%
+  mutate(position = if_else(id %in% to_x, "x", position))  %>%
+  filter(!(id %in% to_exclude)) %>%
+   select(-position_pretty) %>%
+  left_join(position_table)
+```
+
+```{r}
+info_sw %>% select(position, procedure2,  duration.of.experiment) %>% table()
+```
+
+```{r}
+walk(unique(mags1_t_sw$position2), function(p2) {
+    tmp = mags1_t_sw %>% filter(value_type=="value_impute") %>% filter(perplexity==30, position2==p2)
+  gg = ggplot(tmp, aes(X1, X2, color=position))
+  #gg = gg + geom_point()
+  gg = gg + theme_classic()
+  gg = gg + theme(axis.line.x=element_blank(),
+                  axis.line.y=element_blank())
+  gg = gg + scale_color_manual("", values=position_colors)
+  gg = gg + labs(x="Axis1", y="Axis2")
+  gg = gg + geom_text(aes(label=id))
+  gg = gg + facet_wrap(~position2, scales="free")
+  print(gg)
+  #ggsave(paste(prefix_tsne, "tsne_impute_colorPosition.pdf", sep="/"), width=10, height=10)
+  #save_plot(paste(prefix_tsne, "tsne_colorPosition_text.pdf", sep="/"), gg, base_height=6)
+})
+
+walk(unique(mags1_t_sw$position), function(p) {
+    tmp = mags1_t_sw %>% filter(value_type=="value_impute") %>% filter(perplexity==30, position==p)
+  gg = ggplot(tmp, aes(X1, X2, color=position))
+  #gg = gg + geom_point()
+  gg = gg + theme_classic()
+  gg = gg + theme(axis.line.x=element_blank(),
+                  axis.line.y=element_blank())
+  gg = gg + scale_color_manual("", values=position_colors)
+  gg = gg + labs(x="Axis1", y="Axis2")
+  gg = gg + geom_text(aes(label=id))
+  #gg = gg + facet_wrap(~position2, scales="free")
+  print(gg)
+  #ggsave(paste(prefix_tsne, "tsne_impute_colorPosition.pdf", sep="/"), width=10, height=10)
+  #save_plot(paste(prefix_tsne, "tsne_colorPosition_text.pdf", sep="/"), gg, base_height=6)
+})
+```
+
+```{r}
+map(values, function(val) {
+tmp = mags1_t_sw %>% filter(perplexity==30)  %>% filter(value_type==val)
+gg = ggplot(tmp, aes(X1, X2, color=position_pretty))
+gg = gg + geom_point()
+gg = gg + theme_classic()
+gg = gg + theme(axis.line.x=element_blank(),
+                axis.line.y=element_blank())
+gg = gg + scale_color_manual("", values=position_pretty_colors)
+gg = gg + labs(x="Axis1", y="Axis2")
+gg = gg + geom_text(aes(label=id))
+gg = gg + facet_wrap(~position2, scales="free")
+print(gg)
+#ggsave(paste(prefix_tsne, "tsne_impute_colorPosition.pdf", sep="/"), width=10, height=10)
+save_plot(paste(prefix_tsne, sprintf("tsne_colorPosition_text_exclude_%s.pdf", val), sep="/"), gg, base_height=6)
+})
+```
+
+```{r}
+walk(values, function(val) {
+  tmp = mags1_t_sw %>% filter(perplexity==30)  %>%
+    filter(value_type==val)
+  gg = ggplot(tmp, aes(X1, X2, color=position_pretty))
+  gg = gg + geom_point()
+  gg = gg + theme_classic()
+  gg = gg + theme(axis.line.x=element_blank(),
+                  axis.line.y=element_blank())
+  gg = gg + scale_color_manual("", values=position_pretty_colors)
+  gg = gg + labs(x="Axis1", y="Axis2")
+  #gg = gg + geom_text(aes(label=id))
+  #gg = gg + facet_wrap(~position2, scales="free")
+  gg
+  #ggsave(paste(prefix_tsne, "tsne_impute_colorPosition.pdf", sep="/"), width=10, height=10)
+  save_plot(paste(prefix_tsne, sprintf("tsne_colorPosition_exclude_%s.pdf", val), sep="/"), gg, base_height=6, base_aspect_ratio = 1.3)
+})
+```
+
+```{r}
+perp = 30
+tmp = mags1_t_sw %>% filter(perplexity==perp)
+a = map(color_vars_discrete, function(x) {
+  gg = ggplot(tmp, aes_string("X1", "X2", color=x))
+  gg = gg + geom_point()
+  gg = gg + facet_wrap(~perplexity)
+  print(gg)
+  save_plot(file.path(prefix_tsne,sprintf("tsne_%s_perp%s_exclude.pdf", x, perp)), gg, base_height=5, base_aspect_ratio=1.4)
+})
+
+a = map(color_vars_cont, function(x) {
+  gg = ggplot(tmp, aes_string("X1", "X2", color=x))
+  gg = gg + geom_point()
+  gg = gg + facet_wrap(~perplexity)
+  gg = gg + scale_color_viridis()
+  print(gg)
+  save_plot(file.path(prefix_tsne,sprintf("tsne_%s_perp%s_exclude.pdf", x, perp)), gg, base_height=5, base_aspect_ratio = 1.4)
+})
+```
+### Write out data
+```{r}
+db = src_sqlite(file.path("~/data/umi_db/", "combined.db"), create=T)
+cnames = c("id", "id2", "gene_id", "barcode", "value", "value_impute")
+
+
+tname = paste("normalized_filtered", sep="_")
+if (db_has_table(db$con, tname))
+  db_drop_table(db$con, tname)
+mags_out = mags %>% filter(id %in% info_sw$id)
+copy_to(db, mags_out[,cnames], name = tname, temporary=F)
+
+tname = paste("normalized_filtered_batchTags", sep="_")
+if (db_has_table(db$con, tname))
+  db_drop_table(db$con, tname)
+mags_out = mags1 %>% filter(id %in% info_sw$id)
+copy_to(db, mags_out[,cnames], name = tname, temporary=F)
+
+tname = paste("normalized_filtered_batchPositionTags", sep="_")
+if (db_has_table(db$con, tname))
+  db_drop_table(db$con, tname)
+mags_out = mags2 %>% filter(id %in% info_sw$id)
+copy_to(db, mags_out[,cnames], name = tname, temporary=F)
+```
+### Write out modified info
+```{r}
+info_table_cur = "db_info_combined_curated"
+if (db_has_table(db$con, info_table_cur))
+  db_drop_table(db$con, info_table_cur)
+copy_to(db, info_sw, name = info_table_cur, temporary=F)
+```
+
+## Hierarchical clustering
+```{r}
+library(ggdendro)
+library(flashClust)
+source("~/data2/rstudio/birds/utils/ggplot.R")
+source("~/data2/rstudio/birds/utils/mixed_model2.R")
+```
+
+```{r}
+mags2_tmp = mags2 %>% select(gene_id, id, value) %>% left_join(info_sw) %>%
+  filter(!(position %in% c("lfs", "meso", "ov"))) %>%
+  filter(!is.na(position))
+mags2a = acast(mags2_tmp, gene_id~id, value.var="value")
+
+mags_var = apply(mags2a, 1, LogVMR)
+var_filter = .8
+q = quantile(mags_var, var_filter)
+to_hc =  list(mags2a[mags_var>q,])
+
+```
+
+```{r}
+hcs = lapply(1:length(to_hc), function(i) {
+  print(i)
+  x = to_hc[[i]]
+  d = dist(t(x), method = "correlation")
+  hc = flashClust::hclust(d, method = "ward")
+  hc
+})
+
+ddatas = lapply(1:length(to_hc), function(i) {
+  print(i)
+  hc = hcs[[i]]
+  dhc <- as.dendrogram(hc)
+  ddata <- dendro_data(dhc, type = "rectangle")
+  colnames(ddata$labels)[3] = "tags_position"
+  ddata$labels = merge(ddata$labels, info2)
+  ddata$value = names(to_hc)[i]
+  ddata
+})
+names(ddatas) = names(to_hc)
+```
+
+```{r}
+library(dendextend)
+library(circlize)
+```
+
+```{r}
+hc1 = hcs[[1]]
+dend = as.dendrogram(hc1) 
+dend_labels = dend %>% labels
+positions = as.character(info_sw$position[match(dend_labels, info_sw$id)])
+colors = position_colors[positions]
+
+
+dend = dend %>% 
+  color_labels(labels=dend_labels, col=colors) %>%
+  set("leaves_pch", 19) %>%
+  set("leaves_col", colors) %>%
+  set("leaves_cex", 1.5)
+```
+
+```{r}
+circlize_dendrogram(dend, labels=F, dend_track_height = .75 )
+```
+
+```{r}
+plot_circular_dendro = function() {
+  nleaves = length(dend_labels)
+  circos.initialize("foo", xlim = c(0, nleaves))
+  
+  # ## Tags track 
+  # tags = info$tags[match(dend_labels, info$id)]
+  # tags_color = brewer.pal(length(unique(tags)), name = "Dark2")
+  # names(tags_color) = unique(tags)
+  #  circos.track(ylim = c(0, 1), panel.fun = function(x, y) {
+  #   xlim = get.cell.meta.data("xlim")
+  #   print(xlim)
+  #   circos.rect(1:nleaves - .9,
+  #               rep(0, nleaves),
+  #               1:nleaves - 0.1,
+  #               rep(1, nleaves),
+  #               col = tags_color[tags],
+  #               border = NA)
+  # }, bg.border = NA,
+  # track.height=.2)
+   
+  ## Position track
+  circos.track(ylim = c(0, 1), panel.fun = function(x, y) {
+    xlim = get.cell.meta.data("xlim")
+    print(xlim)
+    circos.rect(1:nleaves - .9,
+                rep(0, nleaves),
+                1:nleaves - 0.1,
+                rep(1, nleaves),
+                col = colors,
+                border = NA)
+  }, bg.border = NA,
+  track.height=.2)
+  
+  max_height = attr(dend, "height")
+  dend1 = dend %>% set("leaves_col", NA)
+  circos.track(ylim = c(0, max_height), panel.fun = function(x, y) {
+    circos.dendrogram(dend1, max_height = max_height)
+  }, track.height = 0.5, bg.border = NA)
+  
+}
+plot_circular_dendro()
+```
+
+```{r}
+cairo_pdf(file.path(prefix, "figures", "hclust_circular.pdf"), height=8, width=8)
+plot_circular_dendro()
+dev.off()
+```
+
+
+## Seurat
+```{r}
+library(Seurat)
+```
+
+```{r}
+rnames = rownames(mags2)
+ind = na.omit(unique(unlist(map(tx_mt$gene_name, ~ grep(.x, rnames)))))
+#dat = dat[-ind,]
+mags2 = mags2[-ind,]
+```
+
+```{r}
+seu = CreateSeuratObject(mags2)
+meta_to_add = info %>% select(frac_mito, set, cdr_scaled) %>% as.data.frame() %>%
+  mutate(set=factor(set))
+rownames(meta_to_add) = info$id
+seu <- AddMetaData(object = seu, metadata = meta_to_add, col.name = c("frac_mito", "set", "cdr_scaled"))
+#seu = NormalizeData(seu)
+seu@data = mags2
+
+seu = ScaleData(object = seu, vars.to.regress = c("nUMI", "frac_mito", "set"))
+seu_scale = seu@scale.data
+```
+
+```{r}
+scale_df = melt(seu_scale)
+colnames(scale_df) = c("gene_id", "id", "value")
+scale_df = scale_df %>% left_join(info_red) %>% 
+  mutate(position = factor(position, levels=position_levels),
+                       position_pretty = factor(position_pretty, levels=position_pretty_levels))
+
+meta = seu@meta.data 
+meta$id = as.numeric(rownames(meta))
+#seu_tsne$id = as.numeric(rownames(seu_tsne))
+meta = meta %>% mutate(set=as.numeric(as.character(set)))
+scale_df = scale_df %>% left_join(meta)
+
+```
+
+### Seurat example genes
+```{r}
+gg = ggplot(scale_df %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% c("PVALB", "SLIT1", "MEF2C", "NEFM", "SNCA", "CRHBP")), aes(position, value, color=factor(index1))) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+#gg = gg + geom_text(aes(label=id))
+gg = gg + facet_wrap(~gene_id)
+gg
+
+gg = ggplot(scale_df %>% 
+            #filter(tags=="pk92gr50") %>%
+              filter(position %in% c("ra")) %>%
+         filter(gene_id %in% c("SNCA", "CRHBP")), aes(index1, value, color=frac_mito)) 
+#gg = gg + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + geom_text(aes(label=id))
+gg = gg + facet_wrap(~gene_id)
+gg
+
+
+gg = ggplot(scale_df %>% 
+            #filter(tags=="pk92gr50") %>%
+              filter(position %in% c("ra")) %>%
+         filter(gene_id %in% c("SNCA", "CRHBP")), aes(index1, value, color=lman_lesioned_vol_interp_perc_intact)) 
+#gg = gg + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + geom_text(aes(label=id))
+gg = gg + facet_grid(is_lesion_side~gene_id)
+gg
+
+
+```
+```{r}
+seu = FindVariableGenes(seu, do.plot = T, do.cpp=F)
+```
+
+```{r}
+#seu = RunPCA(seu, pc.genes = rownames(seu_scale))
+seu = RunPCA(seu, do.print = F, )
+```
+
+```{r}
+VizPCA(object = seu, pcs.use = 1:2)
+```
+```{r}
+meta = seu@meta.data 
+meta$id = as.numeric(rownames(meta))
+#seu_tsne$id = as.numeric(rownames(seu_tsne))
+meta = meta %>% mutate(set=as.numeric(as.character(set)))
+mags = mags %>% left_join(meta)
+```
+
+```{r, fig.height=10}
+tp = c(DimTopGenes(seu, dim.use=1, num.genes=5), "CRHBP")
+gg = ggplot(scale_df %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(position, value, color=factor(set))) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=.5) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+gg = ggplot(scale_df %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(position, value, color=factor(lib_column))) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=.5) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+gg = ggplot(scale_df %>% 
+              filter(position=="ra") %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(lib_column, value, color=factor(lib_row))) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=.5) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+gg = ggplot(scale_df %>% 
+              filter(position=="ra") %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(lib_column, value, color=section_area)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=.5) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+
+
+
+
+tp = DimTopGenes(seu, dim.use=2, num.genes=5)
+gg = ggplot(scale_df %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(position, value, color=factor(set))) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=.5) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+gg = ggplot(scale_df %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(position, value, color=nUMI)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=.5) 
+gg = gg + facet_wrap(~gene_id)
+gg
+```
+
+```{r}
+PCAPlot(object = seu, dim.1 = 1, dim.2 = 2)
+```
+
+```{r}
+PCHeatmap(object = seu, pc.use = 1:2, cells.use = 130, do.balanced = TRUE, label.columns = FALSE)
+```
+
+```{r}
+PCElbowPlot(object = seu)
+```
+
+```{r}
+seu <- JackStraw(object = seu, num.replicate = 100, display.progress = TRUE)
+```
+
+```{r}
+JackStrawPlot(object = seu, PCs = 1:20)
+```
+#### Seurat TSNE
+
+```{r}
+seu = RunTSNE(seu, dims.use=1:14)
+```
+
+```{r}
+seu_tsne = GetDimReduction(seu, reduction.type = "tsne", slot = "cell.embeddings") %>% as.data.frame()
+meta = seu@meta.data 
+meta$id = as.numeric(rownames(meta))
+seu_tsne$id = as.numeric(rownames(seu_tsne))
+info = info %>% mutate(set=factor(set))
+seu_tsne = seu_tsne %>% left_join(info) %>% left_join(meta)
+```
+```{r}
+seu_tsne1 = seu_tsne# %>% filter(nUMI>100000)
+color_vars_discrete = c("position", "tags", "brain_side", "procedure2", "lib_column", "lib_row", "is_lesion_side")
+a = map(color_vars_discrete, function(x) {
+  gg = ggplot(seu_tsne1, aes_string("tSNE_1", "tSNE_2", color=x))
+  gg = gg + geom_point()
+  #gg = gg + facet_wrap(~perplexity)
+  print(gg)
+  #save_plot(file.path(prefix_tsne,sprintf("tsne_%s.pdf", x)), gg, base_width=4, ncol=length(perplexity))
+})
+
+color_vars_cont = c("cdr_scaled", "frac_mito", "nUMI", "ratio_umi_mean")
+a = map(color_vars_cont, function(x) {
+  gg = ggplot(seu_tsne1, aes_string("tSNE_1", "tSNE_2", color=x))
+  gg = gg + geom_point()
+  #gg = gg + facet_wrap(~perplexity)
+  gg = gg + scale_color_viridis()
+  print(gg)
+ #save_plot(file.path(prefix_tsne,sprintf("tsne_%s.pdf", x)), gg, base_width=4, ncol=length(perplexity))
+})
+```
+
+
+## Seurat - just 14d
+```{r}
+library(Seurat)
+```
+
+```{r}
+#rnames = rownames(mag)
+# ind = na.omit(unique(unlist(map(tx_mt$gene_name, ~ grep(.x, rnames)))))
+# #dat = dat[-ind,]
+# mags2 = mags2[-ind,]
+```
+
+```{r}
+info14 = info %>% filter(duration.of.experiment=="14")
+mag14 = mag[,match(info14$id, colnames(mag))]
+```
+
+
+```{r}
+seu = CreateSeuratObject(mag14)
+meta_to_add = info14 %>% select(frac_mito, set, cdr_scaled) %>% as.data.frame() %>%
+  mutate(set=factor(set))
+rownames(meta_to_add) = info14$id
+seu <- AddMetaData(object = seu, metadata = meta_to_add, col.name = c("frac_mito", "set", "cdr_scaled"))
+#seu = NormalizeData(seu)
+#seu@data = mags2
+
+seu = ScaleData(object = seu, vars.to.regress = c("nUMI", "frac_mito", "set"))
+seu_scale = seu@scale.data
+```
+
+```{r}
+scale_df = melt(seu_scale)
+colnames(scale_df) = c("gene_id", "id", "value")
+scale_df = scale_df %>% left_join(info_red) %>% 
+  mutate(position = factor(position, levels=position_levels),
+                       position_pretty = factor(position_pretty, levels=position_pretty_levels))
+
+meta = seu@meta.data 
+meta$id = as.numeric(rownames(meta))
+#seu_tsne$id = as.numeric(rownames(seu_tsne))
+meta = meta %>% mutate(set=as.numeric(as.character(set)))
+scale_df = scale_df %>% left_join(meta)
+
+```
+
+### Seurat example genes
+```{r}
+gg = ggplot(scale_df %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% c("PVALB", "SLIT1", "MEF2C", "NEFM", "SNCA", "CRHBP")), aes(position, value, color=factor(index1))) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+#gg = gg + geom_text(aes(label=id))
+gg = gg + facet_wrap(~gene_id)
+gg
+
+gg = ggplot(scale_df %>% 
+            #filter(tags=="pk92gr50") %>%
+              filter(position %in% c("ra")) %>%
+         filter(gene_id %in% c("SNCA", "CRHBP")), aes(index1, value, color=frac_mito)) 
+#gg = gg + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=1/4) 
+gg = gg + geom_text(aes(label=id))
+gg = gg + facet_wrap(~gene_id)
+gg
+
+
+```
+```{r}
+seu = FindVariableGenes(seu, do.plot = T, do.cpp=F)
+```
+
+```{r}
+#seu = RunPCA(seu, pc.genes = rownames(seu_scale))
+seu = RunPCA(seu, do.print = F)
+```
+
+```{r}
+VizPCA(object = seu, pcs.use = 1:2)
+```
+```{r}
+meta = seu@meta.data 
+meta$id = as.numeric(rownames(meta))
+#seu_tsne$id = as.numeric(rownames(seu_tsne))
+meta = meta %>% mutate(set=as.numeric(as.character(set)))
+
+mags14 = mags %>% filter(duration.of.experiment=="14")
+mags14 = mags14 %>% left_join(meta)
+```
+
+```{r, fig.height=10}
+tp = c(DimTopGenes(seu, dim.use=1, num.genes=5), "CRHBP")
+gg = ggplot(scale_df %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(position, value, color=factor(set))) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=.5) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+# gg = ggplot(scale_df %>% 
+#             #filter(tags=="pk92gr50") %>%
+#          filter(gene_id %in% tp), aes(position, value, color=factor(lib_column))) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=.5) 
+# gg = gg + facet_wrap(~gene_id)
+# gg
+
+# gg = ggplot(scale_df %>% 
+#               filter(position=="ra") %>% 
+#             #filter(tags=="pk92gr50") %>%
+#          filter(gene_id %in% tp), aes(lib_column, value, color=factor(lib_row))) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=.5) 
+# gg = gg + facet_wrap(~gene_id)
+# gg
+
+gg = ggplot(scale_df %>% 
+              filter(position=="ra") %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(lib_column, value, color=section_area)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=.5) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+
+
+
+
+tp = DimTopGenes(seu, dim.use=2, num.genes=5)
+gg = ggplot(scale_df %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(position, value, color=factor(set))) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=.5) 
+gg = gg + facet_wrap(~gene_id)
+gg
+
+gg = ggplot(scale_df %>% 
+            #filter(tags=="pk92gr50") %>%
+         filter(gene_id %in% tp), aes(position, value, color=nUMI)) + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width=.4), alpha=.5) 
+gg = gg + facet_wrap(~gene_id)
+gg
+```
+
+```{r}
+PCAPlot(object = seu, dim.1 = 1, dim.2 = 2)
+```
+
+```{r}
+PCHeatmap(object = seu, pc.use = 1:2, cells.use = 130, do.balanced = TRUE, label.columns = FALSE)
+```
+
+```{r}
+PCElbowPlot(object = seu)
+```
+
+```{r}
+seu <- JackStraw(object = seu, num.replicate = 100, display.progress = TRUE)
+```
+
+```{r}
+JackStrawPlot(object = seu, PCs = 1:8)
+```
+#### Seurat TSNE
+
+```{r}
+seu = RunTSNE(seu, dims.use=1:8)
+```
+
+```{r}
+seu_tsne = GetDimReduction(seu, reduction.type = "tsne", slot = "cell.embeddings") %>% as.data.frame()
+meta = seu@meta.data 
+meta$id = as.numeric(rownames(meta))
+seu_tsne$id = as.numeric(rownames(seu_tsne))
+info14 = info14 %>% mutate(set=factor(set))
+seu_tsne = seu_tsne %>% left_join(info14) %>% left_join(meta)
+```
+```{r}
+seu_tsne1 = seu_tsne# %>% filter(nUMI>100000)
+color_vars_discrete = c("position", "tags", "brain_side", "procedure2", "lib_column", "lib_row", "set")
+a = map(color_vars_discrete, function(x) {
+  gg = ggplot(seu_tsne1, aes_string("tSNE_1", "tSNE_2", color=x))
+  gg = gg + geom_point()
+  #gg = gg + facet_wrap(~perplexity)
+  print(gg)
+  #save_plot(file.path(prefix_tsne,sprintf("tsne_%s.pdf", x)), gg, base_width=4, ncol=length(perplexity))
+})
+
+color_vars_cont = c("cdr_scaled", "frac_mito", "nUMI", "ratio_umi_mean")
+a = map(color_vars_cont, function(x) {
+  gg = ggplot(seu_tsne1, aes_string("tSNE_1", "tSNE_2", color=x))
+  gg = gg + geom_point()
+  #gg = gg + facet_wrap(~perplexity)
+  gg = gg + scale_color_viridis()
+  print(gg)
+ #save_plot(file.path(prefix_tsne,sprintf("tsne_%s.pdf", x)), gg, base_width=4, ncol=length(perplexity))
+})
+```
